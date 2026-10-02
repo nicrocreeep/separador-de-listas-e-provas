@@ -1,13 +1,18 @@
-
-import io
 import re
-import zipfile
+import shutil
 import tempfile
-from pathlib import Path
+import zipfile
 from collections import defaultdict
+from pathlib import Path
 
 import streamlit as st
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader
+
+try:
+    import pikepdf
+except ImportError:
+    pikepdf = None
+
 
 st.set_page_config(
     page_title="Separador de Listas + Provas + Termos",
@@ -15,17 +20,7 @@ st.set_page_config(
     layout="wide",
 )
 
-# ------------------------------------------------------------
-# REGRAS DE IDENTIFICAÇÃO
-# ------------------------------------------------------------
-
-# CPF com ou sem pontuação.
-CPF_RE = re.compile(
-    r"(?<!\d)(\d{3}\.?\d{3}\.?\d{3}-?\d{2})(?!\d)"
-)
-
-# Os códigos dos treinamentos seguem o padrão 40xxx.
-# Ex.: 40794, 40795, ... 40803, 40814.
+CPF_RE = re.compile(r"(?<!\d)(\d{3}\.?\d{3}\.?\d{3}-?\d{2})(?!\d)")
 THEME_RE = re.compile(r"(?<!\d)(40\d{3})(?!\d)")
 
 
@@ -41,7 +36,7 @@ def format_cpf(cpf: str) -> str:
     return f"{cpf[:3]}.{cpf[3:6]}.{cpf[6:9]}-{cpf[9:]}"
 
 
-def extract_cpfs(text: str):
+def extract_cpfs(text: str) -> list[str]:
     found = []
     for match in CPF_RE.findall(text or ""):
         cpf = normalize_cpf(match)
@@ -50,21 +45,11 @@ def extract_cpfs(text: str):
     return found
 
 
-def extract_themes(text: str):
-    found = []
-    for match in THEME_RE.findall(text or ""):
-        if match not in found:
-            found.append(match)
-    return found
-
-
-def extract_theme(text: str, filename: str = "") -> str:
-    # Primeiro tenta o nome do arquivo, pois as provas normalmente
-    # possuem o código do treinamento no nome.
+def extract_theme(text: str = "", filename: str = "") -> str:
     for source in (filename or "", text or ""):
-        themes = extract_themes(source)
-        if themes:
-            return themes[0]
+        match = THEME_RE.search(source)
+        if match:
+            return match.group(1)
     return ""
 
 
@@ -73,174 +58,128 @@ def clean_name(name: str) -> str:
 
 
 def name_from_filename(filename: str) -> str:
-    """
-    Esperado:
-    CPF - 40794 - NOME - TEMA.pdf
-    """
     stem = Path(filename).stem
     parts = [p.strip(" -_") for p in stem.split(" - ")]
-
     if len(parts) >= 3:
-        # O terceiro bloco normalmente é o nome.
         return clean_name(parts[2])
-
     return ""
 
 
-def safe_filename(name: str) -> str:
-    name = re.sub(r'[<>:"/\\|?*]', "_", name)
-    name = re.sub(r"\s+", " ", name).strip()
-    return name[:150] or "SEM_NOME"
-
-
-def safe_extract_zip(uploaded_file, destination: Path):
-    """
-    Extrai ZIP evitando caminhos que tentem sair da pasta de destino.
-    """
+def safe_extract_zip(uploaded_file, destination: Path) -> None:
     destination = destination.resolve()
+    destination.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(uploaded_file) as z:
-        for member in z.infolist():
+    with zipfile.ZipFile(uploaded_file) as zf:
+        for member in zf.infolist():
             target = (destination / member.filename).resolve()
-
             if target != destination and destination not in target.parents:
                 raise ValueError(
-                    f"ZIP inválido: caminho inseguro encontrado ({member.filename})"
+                    f"ZIP inválido: caminho inseguro encontrado: {member.filename}"
                 )
-
             if member.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
             else:
                 target.parent.mkdir(parents=True, exist_ok=True)
-                with z.open(member) as source, open(target, "wb") as out:
-                    while True:
-                        chunk = source.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        out.write(chunk)
+                with zf.open(member) as src, open(target, "wb") as dst:
+                    shutil.copyfileobj(src, dst, length=1024 * 1024)
 
 
-def iter_pdf_files(folder: Path):
-    if not folder.exists():
-        return []
-
+def iter_pdf_files(folder: Path) -> list[Path]:
     return sorted(
         [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() == ".pdf"],
         key=lambda p: str(p).lower(),
     )
 
 
-def copy_pdf_pages(writer: PdfWriter, reader: PdfReader, page_indexes):
-    for idx in page_indexes:
-        if 0 <= idx < len(reader.pages):
-            writer.add_page(reader.pages[idx])
-
-
-# ------------------------------------------------------------
-# LEITURA / INDEXAÇÃO
-# ------------------------------------------------------------
+# ============================================================
+# INDEXAÇÃO
+# ============================================================
 
 @st.cache_data(show_spinner=False)
-def scan_list_pdf(path_str: str, mtime_ns: int):
-    """
-    Lê uma lista de presença.
-    Um PDF pode ter uma ou várias páginas.
-    Cada página é associada ao CPF encontrado naquela página.
-    """
+def scan_list_pdf(path_str: str, mtime_ns: int) -> dict:
     path = Path(path_str)
     reader = PdfReader(str(path))
-
-    theme = extract_theme("", path.name)
+    theme = extract_theme(filename=path.name)
     pages = []
 
     for page_number, page in enumerate(reader.pages):
         text = page.extract_text() or ""
-
         if not theme:
-            theme = extract_theme(text, path.name)
+            theme = extract_theme(text=text, filename=path.name)
 
         cpfs = extract_cpfs(text)
-
-        # Em uma lista normal, a página pertence ao primeiro CPF
-        # identificado naquela página.
         cpf = cpfs[0] if cpfs else ""
-
-        # Tenta identificar o nome junto ao CPF.
         name = ""
+
         if cpf:
-            cpf_formats = [
-                re.escape(format_cpf(cpf)),
-                re.escape(cpf),
-            ]
+            escaped = re.escape(format_cpf(cpf))
+            match = re.search(
+                rf"([A-ZÁÉÍÓÚÀÃÕÇ][A-ZÁÉÍÓÚÀÃÕÇ .'-]{{4,}})\s+{escaped}",
+                text,
+                re.IGNORECASE,
+            )
+            if match:
+                name = clean_name(match.group(1))
 
-            for cpf_pattern in cpf_formats:
-                match = re.search(
-                    r"([A-ZÁÉÍÓÚÀÃÕÇ][A-ZÁÉÍÓÚÀÃÕÇ .'-]{4,})\s+"
-                    + cpf_pattern,
-                    text,
-                    re.IGNORECASE,
-                )
-                if match:
-                    name = clean_name(match.group(1))
-                    break
+        pages.append({"page": page_number, "cpf": cpf, "name": name})
 
-        pages.append(
-            {
-                "page": page_number,
-                "cpf": cpf,
-                "name": name,
-            }
-        )
-
-    return {
-        "theme": theme,
-        "pages": pages,
-        "total_pages": len(reader.pages),
-    }
+    return {"theme": theme, "pages": pages, "total_pages": len(reader.pages)}
 
 
 @st.cache_data(show_spinner=False)
-def scan_proof_pdf(path_str: str, mtime_ns: int):
+def scan_proof_metadata(path_str: str, mtime_ns: int) -> dict:
+    """
+    Otimização importante:
+    a maioria das provas já tem CPF/código/nome no nome do arquivo.
+    Nesse caso, não precisamos abrir o PDF nesta etapa.
+    """
     path = Path(path_str)
-    reader = PdfReader(str(path))
 
-    full_text = "\n".join(
-        (page.extract_text() or "") for page in reader.pages
-    )
-
-    # Primeiro procura no nome do arquivo.
-    cpfs = extract_cpfs(path.name)
-    if not cpfs:
-        cpfs = extract_cpfs(full_text)
-
-    cpf = cpfs[0] if cpfs else ""
-
-    theme = extract_theme("", path.name)
-    if not theme:
-        theme = extract_theme(full_text, path.name)
-
+    cpf_candidates = extract_cpfs(path.name)
+    theme = extract_theme(filename=path.name)
     name = name_from_filename(path.name)
 
+    if cpf_candidates and theme and name:
+        return {
+            "cpf": cpf_candidates[0],
+            "theme": theme,
+            "name": name,
+            "pages": 0,
+            "needs_pdf_read": True,
+        }
+
+    # Fallback somente para arquivos fora do padrão.
+    reader = PdfReader(str(path))
+    text = "\n".join(page.extract_text() or "" for page in reader.pages)
+
+    if not cpf_candidates:
+        cpf_candidates = extract_cpfs(text)
+
+    if not theme:
+        theme = extract_theme(text=text, filename=path.name)
+
     if not name:
-        match = re.search(
-            r"Nome\s*:\s*([^\n]+)",
-            full_text,
-            re.IGNORECASE,
-        )
+        match = re.search(r"Nome\s*:\s*([^\n]+)", text, re.IGNORECASE)
         if match:
             name = clean_name(match.group(1))
 
     return {
-        "cpf": cpf,
+        "cpf": cpf_candidates[0] if cpf_candidates else "",
         "theme": theme,
         "name": name,
         "pages": len(reader.pages),
+        "needs_pdf_read": True,
     }
 
 
 @st.cache_data(show_spinner=False)
-def scan_term_pdf(path_str: str, mtime_ns: int):
-    """Lê termos de alteração, normalmente um termo por página."""
+def get_pdf_page_count(path_str: str, mtime_ns: int) -> int:
+    reader = PdfReader(str(path_str))
+    return len(reader.pages)
+
+
+@st.cache_data(show_spinner=False)
+def scan_term_pdf(path_str: str, mtime_ns: int) -> list[dict]:
     path = Path(path_str)
     reader = PdfReader(str(path))
     pages = []
@@ -251,7 +190,11 @@ def scan_term_pdf(path_str: str, mtime_ns: int):
         cpf = cpfs[0] if cpfs else ""
 
         name = ""
-        match = re.search(r"Eu,\s*(.+?),\s*CPF", text, re.IGNORECASE | re.DOTALL)
+        match = re.search(
+            r"Eu,\s*(.+?),\s*CPF",
+            text,
+            re.IGNORECASE | re.DOTALL,
+        )
         if match:
             name = clean_name(match.group(1))
 
@@ -279,12 +222,10 @@ def scan_term_pdf(path_str: str, mtime_ns: int):
 
 def build_index(list_files, proof_files, term_files=None, progress_callback=None):
     term_files = term_files or []
-
     lists_by_cpf = defaultdict(list)
     proofs_by_cpf = defaultdict(list)
     terms_by_cpf = defaultdict(list)
     names = {}
-
     list_rows = []
     proof_rows = []
     term_rows = []
@@ -293,7 +234,7 @@ def build_index(list_files, proof_files, term_files=None, progress_callback=None
     total = max(len(list_files) + len(proof_files) + len(term_files), 1)
     done = 0
 
-    # LISTAS
+    # LISTAS: leitura página a página é necessária.
     for path in list_files:
         try:
             info = scan_list_pdf(str(path), path.stat().st_mtime_ns)
@@ -321,29 +262,22 @@ def build_index(list_files, proof_files, term_files=None, progress_callback=None
             )
         except Exception as error:
             list_rows.append(
-                {
-                    "Arquivo": path.name,
-                    "Tema": f"ERRO: {error}",
-                    "Páginas": 0,
-                }
+                {"Arquivo": path.name, "Tema": f"ERRO: {error}", "Páginas": 0}
             )
 
         done += 1
         if progress_callback:
             progress_callback(done / total)
 
-    # PROVAS
+    # PROVAS: normalmente só lê nome do arquivo.
     for path in proof_files:
         try:
-            info = scan_proof_pdf(str(path), path.stat().st_mtime_ns)
+            info = scan_proof_metadata(str(path), path.stat().st_mtime_ns)
             cpf = info["cpf"]
 
             if cpf:
                 proofs_by_cpf[cpf].append(
-                    {
-                        "path": str(path),
-                        "theme": info["theme"],
-                    }
+                    {"path": str(path), "theme": info["theme"]}
                 )
                 if info["name"]:
                     names.setdefault(cpf, info["name"])
@@ -357,18 +291,14 @@ def build_index(list_files, proof_files, term_files=None, progress_callback=None
             )
         except Exception as error:
             proof_rows.append(
-                {
-                    "Arquivo": path.name,
-                    "CPF": f"ERRO: {error}",
-                    "Tema": "",
-                }
+                {"Arquivo": path.name, "CPF": f"ERRO: {error}", "Tema": ""}
             )
 
         done += 1
         if progress_callback:
             progress_callback(done / total)
 
-    # TERMOS (OPCIONAL)
+    # TERMOS: um PDF pode conter vários termos, um por página.
     for path in term_files:
         try:
             pages = scan_term_pdf(str(path), path.stat().st_mtime_ns)
@@ -389,13 +319,7 @@ def build_index(list_files, proof_files, term_files=None, progress_callback=None
                     if item["name"]:
                         names.setdefault(cpf, item["name"])
                 else:
-                    # Sem CPF: não dá para vincular automaticamente.
-                    unmatched_terms.append(
-                        {
-                            **item,
-                            "reason": "CPF NÃO IDENTIFICADO",
-                        }
-                    )
+                    unmatched_terms.append({**item, "reason": "CPF NÃO IDENTIFICADO"})
         except Exception as error:
             term_rows.append(
                 {
@@ -411,7 +335,6 @@ def build_index(list_files, proof_files, term_files=None, progress_callback=None
         if progress_callback:
             progress_callback(done / total)
 
-    # Qualquer termo com CPF que não aparece nas listas/provas vai para revisão manual.
     people_cpfs = set(lists_by_cpf) | set(proofs_by_cpf)
     for cpf, items in terms_by_cpf.items():
         if cpf not in people_cpfs:
@@ -437,16 +360,29 @@ def build_index(list_files, proof_files, term_files=None, progress_callback=None
 
 def theme_sort_key(entry):
     theme = entry.get("theme", "")
-
     if theme.isdigit():
         return (0, int(theme), entry.get("path", ""), entry.get("page", -1))
-
     return (1, 999999, entry.get("path", ""), entry.get("page", -1))
 
 
-# ------------------------------------------------------------
-# GERAÇÃO DO PDF ÚNICO
-# ------------------------------------------------------------
+def term_sort_key(entry):
+    return (
+        entry.get("date", ""),
+        entry.get("path", ""),
+        entry.get("page", -1),
+    )
+
+
+# ============================================================
+# GERAÇÃO DO PDF — qpdf via pikepdf
+# ============================================================
+
+def require_pikepdf():
+    if pikepdf is None:
+        raise RuntimeError(
+            "pikepdf não está instalado. Atualize o requirements.txt e faça um novo deploy."
+        )
+
 
 def generate_big_pdf(
     cpfs,
@@ -454,102 +390,81 @@ def generate_big_pdf(
     proofs_by_cpf,
     terms_by_cpf,
     names,
-    output_path,
+    output_path: Path,
     progress_callback=None,
 ):
     """
-    Gera UM ÚNICO PDF gigante:
-      colaborador -> listas -> provas -> termo(s), se houver
-    """
-    writer = PdfWriter()
-    total = max(len(cpfs), 1)
-    current_page = 0
+    Gera o PDF diretamente a partir dos arquivos em disco usando qpdf/pikepdf.
 
-    def term_sort_key(entry):
-        return (
-            entry.get("date", ""),
-            entry.get("path", ""),
-            entry.get("page", -1),
-        )
+    Isso evita manter milhares de páginas dentro de um PdfWriter em memória.
+    """
+    require_pikepdf()
+
+    job = pikepdf.JobBuilder().empty().output(str(output_path))
+    total = max(len(cpfs), 1)
 
     for position, cpf in enumerate(cpfs, start=1):
-        name = names.get(cpf, "SEM NOME")
-        first_page_of_person = current_page
-
-        # 1. LISTAS
+        # LISTAS
         for entry in sorted(lists_by_cpf.get(cpf, []), key=theme_sort_key):
-            reader = PdfReader(entry["path"])
-            copy_pdf_pages(writer, reader, [entry["page"]])
-            current_page += 1
+            page_number = entry["page"] + 1  # qpdf usa página 1-based.
+            job = job.add_pages(entry["path"], str(page_number))
 
-        # 2. PROVAS
+        # PROVAS
         for entry in sorted(proofs_by_cpf.get(cpf, []), key=theme_sort_key):
-            reader = PdfReader(entry["path"])
-            copy_pdf_pages(writer, reader, range(len(reader.pages)))
-            current_page += len(reader.pages)
+            job = job.add_pages(entry["path"])
 
-        # 3. TERMO(S) OPCIONAL(IS) — sempre depois das provas
+        # TERMOS
         for entry in sorted(terms_by_cpf.get(cpf, []), key=term_sort_key):
-            reader = PdfReader(entry["path"])
-            copy_pdf_pages(writer, reader, [entry["page"]])
-            current_page += 1
-
-        if current_page > first_page_of_person:
-            try:
-                writer.add_outline_item(
-                    f"{name} - {format_cpf(cpf)}",
-                    first_page_of_person,
-                )
-            except Exception:
-                pass
+            page_number = entry["page"] + 1
+            job = job.add_pages(entry["path"], str(page_number))
 
         if progress_callback:
             progress_callback(position / total)
 
-    with open(output_path, "wb") as output:
-        writer.write(output)
+    job.run()
 
 
-def generate_unmatched_terms_pdf(unmatched_terms, output_path):
-    """Gera um PDF separado só com os termos que precisam de revisão manual."""
-    writer = PdfWriter()
+def generate_unmatched_terms_pdf(unmatched_terms, output_path: Path):
+    require_pikepdf()
 
-    def key(item):
-        return (item.get("path", ""), item.get("page", -1))
-
-    for item in sorted(unmatched_terms, key=key):
-        reader = PdfReader(item["path"])
-        copy_pdf_pages(writer, reader, [item["page"]])
-
-    with open(output_path, "wb") as output:
-        writer.write(output)
+    job = pikepdf.JobBuilder().empty().output(str(output_path))
+    for item in sorted(
+        unmatched_terms,
+        key=lambda x: (x.get("path", ""), x.get("page", -1)),
+    ):
+        page_number = item["page"] + 1
+        job = job.add_pages(item["path"], str(page_number))
+    job.run()
 
 
-# ------------------------------------------------------------
+# ============================================================
+# DOWNLOAD LAZY — não carrega o PDF gigante na RAM antes do clique
+# ============================================================
+
+def download_file(path: str):
+    return open(path, "rb")
+
+
+# ============================================================
 # INTERFACE
-# ------------------------------------------------------------
+# ============================================================
 
 def main():
     st.title("📚 Separador de Listas + Provas + Termos")
     st.markdown(
         """
-        **Regra do sistema:** o CPF é a chave principal.
+        **Chave principal: CPF.**
 
-        Para cada colaborador, o PDF final ficará assim:
+        Para cada colaborador:
 
-        **TODAS AS LISTAS → TODAS AS PROVAS → TERMO(S), quando houver**
+        **LISTAS → PROVAS → TERMO(S), quando houver**
 
-        As listas e provas são organizadas pela ordem numérica do código
-        do treinamento (ex.: 40794, 40795, ... 40814).
-
-        Os termos de alteração são opcionais: se não existir termo para um CPF,
-        o colaborador entra normalmente, sem termo.
+        O resultado principal é **um único PDF gigante**, pronto para impressão.
         """
     )
 
     st.info(
-        "💡 Para milhares de PDFs, compacte cada grupo em ZIP. "
-        "O aplicativo aceita um ou vários ZIPs em cada campo."
+        "💡 Pode enviar vários ZIPs em cada campo. Ex.: turma_13.zip + turma_121.zip."
     )
 
     col1, col2 = st.columns(2)
@@ -561,7 +476,7 @@ def main():
             type=["zip"],
             accept_multiple_files=True,
             key="proofs",
-            help="Você pode enviar um ZIP grande ou vários ZIPs.",
+            help="Um ZIP por turma ou quantos forem necessários.",
         )
 
     with col2:
@@ -571,134 +486,94 @@ def main():
             type=["zip"],
             accept_multiple_files=True,
             key="lists",
-            help="Você pode enviar um ZIP grande ou vários ZIPs.",
+            help="Um ZIP por turma ou quantos forem necessários.",
         )
 
     st.subheader("🩺 TERMOS DE ALTERAÇÃO DE EXAMES/ASOS — opcional")
     term_zips = st.file_uploader(
-        "Envie o(s) ZIP(s) dos termos. Pode deixar vazio quando a turma não tiver termos.",
+        "Envie o(s) ZIP(s) dos termos. Um PDF pode conter vários termos, um por página.",
         type=["zip"],
         accept_multiple_files=True,
         key="terms",
-        help="Um termo por página é aceito. O CPF é usado para fazer o vínculo automático.",
     )
 
     if not proof_zips or not list_zips:
-        st.warning(
-            "Envie pelo menos um ZIP de PROVAS e um ZIP de LISTAS para continuar."
-        )
+        st.warning("Envie pelo menos um ZIP de PROVAS e um ZIP de LISTAS.")
         st.stop()
 
-    # --------------------------------------------------------
-    # EXTRAÇÃO
-    # --------------------------------------------------------
+    if st.button("🔎 ANALISAR ARQUIVOS", type="primary", width="stretch"):
+        # Descarta análise e arquivos anteriores para liberar espaço.
+        old_root = st.session_state.get("temp_root")
+        if old_root:
+            shutil.rmtree(old_root, ignore_errors=True)
 
-    if st.button(
-        "🔎 ANALISAR ARQUIVOS",
-        type="primary",
-        use_container_width=True,
-    ):
+        for key in (
+            "temp_root",
+            "proof_files",
+            "list_files",
+            "term_files",
+            "index",
+            "final_pdf",
+            "unmatched_pdf",
+        ):
+            st.session_state.pop(key, None)
+
+        temp_root = Path(tempfile.mkdtemp(prefix="separador_listas_provas_"))
+        proof_root = temp_root / "provas"
+        list_root = temp_root / "listas"
+        term_root = temp_root / "termos"
+        proof_root.mkdir(parents=True)
+        list_root.mkdir(parents=True)
+        term_root.mkdir(parents=True)
+
         with st.spinner("Extraindo os ZIPs..."):
-            temp_root = Path(
-                tempfile.mkdtemp(
-                    prefix="separador_listas_provas_"
-                )
-            )
-
-            proof_root = temp_root / "provas"
-            list_root = temp_root / "listas"
-            term_root = temp_root / "termos"
-
-            proof_root.mkdir(parents=True, exist_ok=True)
-            list_root.mkdir(parents=True, exist_ok=True)
-            term_root.mkdir(parents=True, exist_ok=True)
-
             try:
                 for index, uploaded_zip in enumerate(proof_zips, start=1):
-                    safe_extract_zip(
-                        uploaded_zip,
-                        proof_root / f"zip_{index}",
-                    )
-
+                    safe_extract_zip(uploaded_zip, proof_root / f"zip_{index}")
                 for index, uploaded_zip in enumerate(list_zips, start=1):
-                    safe_extract_zip(
-                        uploaded_zip,
-                        list_root / f"zip_{index}",
-                    )
-
+                    safe_extract_zip(uploaded_zip, list_root / f"zip_{index}")
                 for index, uploaded_zip in enumerate(term_zips, start=1):
-                    safe_extract_zip(
-                        uploaded_zip,
-                        term_root / f"zip_{index}",
-                    )
-
+                    safe_extract_zip(uploaded_zip, term_root / f"zip_{index}")
             except Exception as error:
+                shutil.rmtree(temp_root, ignore_errors=True)
                 st.error(f"Erro ao extrair ZIP: {error}")
                 st.stop()
 
-            proof_files = iter_pdf_files(proof_root)
-            list_files = iter_pdf_files(list_root)
-            term_files = iter_pdf_files(term_root)
-
-            st.session_state["temp_root"] = str(temp_root)
-            st.session_state["proof_files"] = [
-                str(p) for p in proof_files
-            ]
-            st.session_state["list_files"] = [
-                str(p) for p in list_files
-            ]
-            st.session_state["term_files"] = [
-                str(p) for p in term_files
-            ]
+        st.session_state["temp_root"] = str(temp_root)
+        st.session_state["proof_files"] = [str(p) for p in iter_pdf_files(proof_root)]
+        st.session_state["list_files"] = [str(p) for p in iter_pdf_files(list_root)]
+        st.session_state["term_files"] = [str(p) for p in iter_pdf_files(term_root)]
 
     if "proof_files" not in st.session_state:
         st.stop()
 
-    proof_files = [
-        Path(p) for p in st.session_state["proof_files"]
-    ]
+    proof_files = [Path(p) for p in st.session_state["proof_files"]]
+    list_files = [Path(p) for p in st.session_state["list_files"]]
+    term_files = [Path(p) for p in st.session_state.get("term_files", [])]
 
-    list_files = [
-        Path(p) for p in st.session_state["list_files"]
-    ]
-    term_files = [
-        Path(p) for p in st.session_state.get("term_files", [])
-    ]
-
-    st.success(
-        f"Encontrados **{len(proof_files):,} PDFs de provas**, "
-        f"**{len(list_files):,} PDFs de listas** e "
-        f"**{len(term_files):,} PDFs de termos**."
-    )
+    c1, c2, c3 = st.columns(3)
+    c1.metric("PDFs de provas", len(proof_files))
+    c2.metric("PDFs de listas", len(list_files))
+    c3.metric("PDFs de termos", len(term_files))
 
     if not proof_files:
-        st.error("Nenhuma prova em PDF foi encontrada.")
+        st.error("Nenhum PDF de prova foi encontrado.")
         st.stop()
-
     if not list_files:
-        st.error("Nenhuma lista em PDF foi encontrada.")
+        st.error("Nenhum PDF de lista foi encontrado.")
         st.stop()
-
-    # --------------------------------------------------------
-    # INDEXAÇÃO
-    # --------------------------------------------------------
 
     if "index" not in st.session_state:
         st.subheader("🔍 Cruzamento por CPF")
-
-        index_progress = st.progress(0)
-
-        with st.spinner("Lendo os PDFs e identificando CPFs..."):
+        progress = st.progress(0)
+        with st.spinner("Analisando documentos..."):
             index = build_index(
                 list_files,
                 proof_files,
                 term_files,
-                progress_callback=lambda value: index_progress.progress(
-                    int(value * 100)
-                ),
+                progress_callback=lambda value: progress.progress(int(value * 100)),
             )
-
-        index_progress.progress(100)
+        progress.progress(100)
         st.session_state["index"] = index
 
     (
@@ -712,25 +587,16 @@ def main():
         unmatched_terms,
     ) = st.session_state["index"]
 
-    # --------------------------------------------------------
-    # TABELA DE CONFERÊNCIA
-    # --------------------------------------------------------
-
     cpfs = sorted(
         set(lists_by_cpf) | set(proofs_by_cpf),
-        key=lambda cpf: (
-            names.get(cpf, "").upper(),
-            cpf,
-        ),
+        key=lambda cpf: (names.get(cpf, "").upper(), cpf),
     )
 
     rows = []
-
     for cpf in cpfs:
         list_count = len(lists_by_cpf.get(cpf, []))
         proof_count = len(proofs_by_cpf.get(cpf, []))
         term_count = len(terms_by_cpf.get(cpf, []))
-
         if list_count and proof_count:
             status = "OK"
         elif list_count:
@@ -750,81 +616,37 @@ def main():
         )
 
     st.subheader("📋 Conferência")
+    st.dataframe(rows, width="stretch", hide_index=True)
 
-    st.dataframe(
-        rows,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    complete = [
-        r for r in rows
-        if r["Situação"] == "OK"
-    ]
-
-    no_list = [
-        r for r in rows
-        if r["Situação"] == "SEM LISTA"
-    ]
-
-    no_proof = [
-        r for r in rows
-        if r["Situação"] == "SEM PROVA"
-    ]
-
+    complete = [r for r in rows if r["Situação"] == "OK"]
     term_person_count = sum(1 for cpf in cpfs if terms_by_cpf.get(cpf))
 
     m1, m2, m3, m4 = st.columns(4)
-
     m1.metric("Colaboradores", len(rows))
     m2.metric("Completos", len(complete))
     m3.metric("Com termo", term_person_count)
     m4.metric("Termos para revisão", len(unmatched_terms))
 
     with st.expander("📄 Detalhes das listas"):
-        st.dataframe(
-            list_rows,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(list_rows, width="stretch", hide_index=True)
 
     with st.expander("📝 Detalhes das provas"):
-        st.dataframe(
-            proof_rows,
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(proof_rows, width="stretch", hide_index=True)
 
     if term_files:
         with st.expander("🩺 Detalhes dos termos"):
-            st.dataframe(
-                term_rows,
-                use_container_width=True,
-                hide_index=True,
-            )
+            st.dataframe(term_rows, width="stretch", hide_index=True)
 
         if unmatched_terms:
             st.warning(
-                f"{len(unmatched_terms)} página(s) de termo não foram vinculadas "
-                "automaticamente. Elas serão colocadas em um PDF separado "
-                "para você fazer a separação manual."
+                f"{len(unmatched_terms)} página(s) de termo não foram vinculadas automaticamente. "
+                "Elas serão colocadas em um PDF separado para revisão manual."
             )
-
-    # --------------------------------------------------------
-    # GERAÇÃO
-    # --------------------------------------------------------
 
     st.divider()
     st.subheader("🖨️ Gerar PDF único para impressão")
-
     st.write(
-        """
-        O sistema **não cria um PDF separado para cada pessoa**.
-
-        Ele cria **um único PDF gigante**, seguindo esta estrutura:
-
-        `Pessoa 1 → Listas → Provas → Termo (se houver) → Pessoa 2 → ...`
-        """
+        "`Pessoa 1 → Listas → Provas → Termo (se houver) → Pessoa 2 → ...`"
     )
 
     only_complete = st.checkbox(
@@ -833,64 +655,54 @@ def main():
     )
 
     selected_labels = st.multiselect(
-        "Opcional: escolha colaboradores específicos "
-        "(deixe vazio para todos)",
-        options=[
-            f"{r['CPF']} — {r['Nome']}"
-            for r in rows
-        ],
+        "Opcional: escolha colaboradores específicos (vazio = todos)",
+        options=[f"{r['CPF']} — {r['Nome']}" for r in rows],
     )
 
-    selected_cpfs = None
-
-    if selected_labels:
-        selected_cpfs = {
-            normalize_cpf(
-                label.split(" — ", 1)[0]
+    if st.button("🚀 GERAR PDF GIGANTE", type="primary", width="stretch"):
+        if pikepdf is None:
+            st.error(
+                "A versão otimizada usa pikepdf. Atualize o requirements.txt e aguarde o novo deploy."
             )
-            for label in selected_labels
-        }
+            st.stop()
 
-    if st.button(
-        "🚀 GERAR PDF GIGANTE",
-        type="primary",
-        use_container_width=True,
-    ):
-        if selected_cpfs:
-            target_cpfs = [
-                cpf for cpf in cpfs
-                if cpf in selected_cpfs
-            ]
-        else:
-            target_cpfs = cpfs.copy()
+        selected_cpfs = None
+        if selected_labels:
+            selected_cpfs = {
+                normalize_cpf(label.split(" — ", 1)[0])
+                for label in selected_labels
+            }
+
+        target_cpfs = [
+            cpf for cpf in cpfs
+            if selected_cpfs is None or cpf in selected_cpfs
+        ]
 
         if only_complete:
             target_cpfs = [
                 cpf for cpf in target_cpfs
-                if lists_by_cpf.get(cpf)
-                and proofs_by_cpf.get(cpf)
+                if lists_by_cpf.get(cpf) and proofs_by_cpf.get(cpf)
             ]
 
         if not target_cpfs:
-            st.error(
-                "Nenhum colaborador atende aos filtros escolhidos."
-            )
+            st.error("Nenhum colaborador atende aos filtros escolhidos.")
             st.stop()
 
-        with tempfile.TemporaryDirectory(
-            prefix="pdf_final_"
-        ) as output_dir:
+        # Mantém a pasta viva na sessão para o download lazy.
+        root = Path(st.session_state["temp_root"])
+        output_path = root / "LISTAS_PROVAS_TERMOS_COMPLETO.pdf"
+        unmatched_path = root / "TERMOS_NAO_ENCONTRADOS.pdf"
 
-            output_path = (
-                Path(output_dir)
-                / "LISTAS_PROVAS_TERMOS_COMPLETO.pdf"
-            )
+        # Remove resultados anteriores.
+        output_path.unlink(missing_ok=True)
+        unmatched_path.unlink(missing_ok=True)
 
-            progress = st.progress(0)
+        progress = st.progress(0)
 
-            with st.spinner(
-                "Montando o PDF único... isso pode levar alguns minutos."
-            ):
+        with st.spinner(
+            "Montando o PDF gigante com qpdf... isso pode levar alguns minutos."
+        ):
+            try:
                 generate_big_pdf(
                     target_cpfs,
                     lists_by_cpf,
@@ -898,62 +710,57 @@ def main():
                     terms_by_cpf,
                     names,
                     output_path,
-                    progress_callback=lambda value: progress.progress(
-                        int(value * 100)
-                    ),
+                    progress_callback=lambda value: progress.progress(int(value * 100)),
                 )
+            except Exception as error:
+                st.error(f"Erro durante a geração do PDF: {error}")
+                st.stop()
 
-            progress.progress(100)
+        progress.progress(100)
+        st.session_state["final_pdf"] = str(output_path)
 
-            pdf_bytes = output_path.read_bytes()
+        st.success(
+            f"PDF gigante criado com sucesso: {len(target_cpfs):,} colaboradores."
+        )
+        st.caption(
+            f"Tamanho: {output_path.stat().st_size / (1024 * 1024):.1f} MB"
+        )
 
-            st.success(
-                f"PDF gerado com sucesso! "
-                f"{len(target_cpfs):,} colaboradores incluídos."
-            )
+        st.download_button(
+            "⬇️ BAIXAR PDF GIGANTE",
+            data=lambda: download_file(str(output_path)),
+            file_name="LISTAS_PROVAS_TERMOS_COMPLETO.pdf",
+            mime="application/pdf",
+            on_click="ignore",
+            width="stretch",
+        )
 
-            st.download_button(
-                "⬇️ BAIXAR PDF GIGANTE",
-                data=pdf_bytes,
-                file_name="LISTAS_PROVAS_TERMOS_COMPLETO.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-            )
-
-            if unmatched_terms:
-                unmatched_path = Path(output_dir) / "TERMOS_NAO_ENCONTRADOS.pdf"
-                generate_unmatched_terms_pdf(unmatched_terms, unmatched_path)
-                unmatched_bytes = unmatched_path.read_bytes()
-
-                st.warning(
-                    "Também foi criado um segundo PDF contendo somente os "
-                    "termos sem correspondência automática."
-                )
-
-                st.download_button(
-                    "⬇️ BAIXAR TERMOS NÃO ENCONTRADOS",
-                    data=unmatched_bytes,
-                    file_name="TERMOS_NAO_ENCONTRADOS.pdf",
-                    mime="application/pdf",
-                    use_container_width=True,
-                )
-
-            st.caption(
-                f"Tamanho do arquivo: "
-                f"{len(pdf_bytes) / (1024 * 1024):.1f} MB"
-            )
-
-            st.info(
-                "📑 O PDF possui marcadores internos por colaborador "
-                "quando o leitor de PDF oferece suporte a marcadores."
-            )
+        if unmatched_terms:
+            with st.spinner("Separando os termos que precisam de revisão manual..."):
+                try:
+                    generate_unmatched_terms_pdf(unmatched_terms, unmatched_path)
+                except Exception as error:
+                    st.warning(
+                        f"O PDF principal foi gerado, mas o PDF de termos para revisão falhou: {error}"
+                    )
+                else:
+                    st.session_state["unmatched_pdf"] = str(unmatched_path)
+                    st.warning(
+                        f"{len(unmatched_terms)} página(s) de termo precisam de revisão manual."
+                    )
+                    st.download_button(
+                        "⬇️ BAIXAR TERMOS NÃO ENCONTRADOS",
+                        data=lambda: download_file(str(unmatched_path)),
+                        file_name="TERMOS_NAO_ENCONTRADOS.pdf",
+                        mime="application/pdf",
+                        on_click="ignore",
+                        width="stretch",
+                    )
 
     st.divider()
-
     st.caption(
-        "Chave de cruzamento: CPF. "
-        "O nome é usado apenas para identificação. "
-        "Termos são opcionais e entram somente quando o CPF é encontrado."
+        "CPF = chave principal. Termos são opcionais. Um PDF de termos pode conter vários termos, "
+        "um por página; cada página é vinculada pelo CPF."
     )
 
 
